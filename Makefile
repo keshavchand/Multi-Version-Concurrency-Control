@@ -7,6 +7,6 @@ mvccSim: main.cpp
 
 .PHONY: clean
 clean:
-	rm mvccSim
+	rm mvccSim a.out
 
 
