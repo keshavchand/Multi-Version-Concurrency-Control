@@ -6,7 +6,7 @@ using namespace std;
 using uint64 = unsigned long long;
 using uint32 = unsigned long long;
 
-#define UNIMPLEMENTED assert(0 && "Unimplemented")
+#define UNIMPLEMENTED assert(false && "Unimplemented")
 #define atomic_add(ptr, val) __atomic_add_fetch(ptr, val, __ATOMIC_ACQ_REL)
 #define atomic_fetch(ptr) __atomic_load_n(ptr, __ATOMIC_ACQUIRE)
 #define atomic_store(ptr, val) __atomic_store_n(ptr, val, __ATOMIC_RELEASE)
@@ -26,6 +26,9 @@ struct Transaction {
 		this->tid = atomic_add(&GlobalTid, 1);
 	}
 };
+
+template<typename T>
+struct Tuple;
 
 // Multi Version Timestamp Ordering
 struct MVTO {
@@ -79,7 +82,6 @@ struct MVTO {
 			atomic_store(&this->tid, tid);
 			return true;
 		}
-
 		// Failed To Lock
 		return false;
 	}
@@ -87,12 +89,18 @@ struct MVTO {
 	// Tuple valid for the transaction
 	bool IsValid(const Transaction& T) {
 		uint64 tid = T.tid;
-		return this->begin <= tid && tid < this->end && tid >= this->read;
+		uint64 begin = atomic_fetch(&this->begin);
+		uint64 end 	 = atomic_fetch(&this->end);
+		uint64 read  = atomic_fetch(&this->read);
+
+		return begin <= tid && tid < end && tid >= read;
 	}
 
 	// Notify the tuple that it is being read
 	bool Read(const Transaction& T) {
-		atomic_store(&this->read, T.tid);
+		uint64 oldRead = atomic_fetch(&this->read);
+		if (oldRead < T.tid)
+				return atomic_cas(&this->read, &oldRead, T.tid);
 		return true;
 	}
 
@@ -110,6 +118,9 @@ struct MVTO {
 		atomic_store(&this->begin, (uint64) -1);
 	}
 
+	struct Status {
+		bool success;
+	};
 };
 
 // Multi Version Optimistic Concurrecy Control
@@ -270,30 +281,31 @@ struct Tuple {
 	double c;
 
 	Tuple() {}
-	Tuple(const Transaction& T, int a, float b, double c) {
+	Tuple(const Transaction& T, int a, float b, double c)
+		: cc(ConcurrencyControl(T)) {
 		this->a = a;
 		this->b = b;
 		this->c = c;
-		this->cc = ConcurrencyControl(T);
+		// this->cc = ConcurrencyControl(T);
 	}
 
-	Tuple(const Transaction& T, const Tuple &d) {
+	Tuple(const Transaction& T, const Tuple &d)
+		: cc(ConcurrencyControl(T)) {
 		this->a = d.a;
 		this->b = d.b;
 		this->c = d.c;
-		this->cc = ConcurrencyControl(T);
+		// this->cc = ConcurrencyControl(T);
 	}
 };
 
-using CC = MV2PL;
-// using CC = MVOCC;
-using TupleCC = Tuple<CC>;
-
+template <typename CC>
 struct Relation {
-	pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-	vector<TupleCC> relation;
+	using TupleCC = Tuple<CC>;
 	using TupleGenerator = void (*) (Transaction&, TupleCC&);
 	using TupleUpdater = void (*) (Transaction&, TupleCC&, TupleCC&);
+
+	pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+	vector<TupleCC> relation;
 
 	Relation() {
 		pthread_mutex_init(&mutex, NULL);
@@ -315,11 +327,10 @@ struct Relation {
 	uint64 Insert(TupleCC& t);
 };
 
-Relation Relation;
-
 // This function call unlocks the tuple 
 // no need to call it at the moment
-uint64 Relation::Insert(TupleCC& t) {
+template <typename CC>
+uint64 Relation<CC>::Insert(TupleCC& t) {
 	pthread_mutex_lock(&mutex);
 
 	int pos = relation.size();
@@ -330,163 +341,40 @@ uint64 Relation::Insert(TupleCC& t) {
 	return pos;
 }
 
-template <typename T> 
-void test() {}
-
-template <> 
-void test<MVTO>() {
-	Transaction txn1;
-
-	TupleCC t1 = TupleCC(txn1, 1, 2.0, 3.0);
-	uint64 pos = Relation.Insert(t1);
-	
-	// transaction 2 tries to update it
-	Transaction txn2;
-	TupleCC& tup1 = Relation[pos]; // Get the original tuple
-	assert(tup1.cc.IsValid(txn2) && "This is a valid update");
-
-	TupleCC tup2 = TupleCC(txn2, tup1); // Create new Tuple
-	tup2.b = 3.0f; // Changes
-
-	bool success = tup1.cc.TryLock(txn2); // Lock the tuple for no more changes
-	assert(success && "This lock should succeed"); 
-
-	uint64 newPos = Relation.Insert(tup2); // Insert
-	tup1.cc.Retire(txn2); // Retire the tuple
-	tup1.cc.Unlock();
-												
-	// Testing for overlaps in writing
-	Transaction Txn3, Txn4, Txn5;
-	TupleCC _tup3 = TupleCC(Txn3, 1, 2.0, 3.0);
-	pos = Relation.Insert(_tup3);
-
-	TupleCC& tup3 = Relation[pos];
-	tup3.cc.Read(Txn4);
-	tup3.cc.Read(Txn5);
-
-	Txn4.Update();
-	success = tup3.cc.TryLock(Txn4);
-	assert(success && "This lock should succeed"); 
-
-	Txn5.Update();
-	success = tup3.cc.TryLock(Txn5);
-	assert(!success && "This lock should not succeed"); 
-
-	TupleCC tup4 = TupleCC(Txn4, tup3);
-
-	tup4.b = 3;
-
-	Relation.Insert(tup4);
-
-	success = tup3.cc.Retire(Txn5);
-	assert(!success && "This retire should not succeed");
-
-	success = tup3.cc.Retire(Txn4);
-	assert(success && "This retire should succeed");
-}
-
-template <>
-void test<MV2PL>() {
-	Transaction txn1;
-
-	TupleCC t1 = TupleCC(txn1, 1, 2.0, 3.0);
-	uint64 pos = Relation.Insert(t1);
-	
-	// transaction 2 tries to update it
-	Transaction txn2;
-	TupleCC& tup1 = Relation[pos]; // Get the original tuple
-	assert(tup1.cc.IsValid(txn2) && "This is a valid update");
-
-	TupleCC tup2 = TupleCC(txn2, tup1); // Create new Tuple
-	tup2.b = 3.0f; // Changes
-
-	bool success = tup1.cc.TryLock(txn2); // Lock the tuple for no more changes
-	assert(success && "This lock should succeed"); 
-
-	uint64 newPos = Relation.Insert(tup2); // Insert
-	tup1.cc.Retire(txn2); // Retire the tuple
-	tup1.cc.Unlock();
-												
-	// Testing for overlaps in writing
-	Transaction Txn3, Txn4, Txn5;
-	TupleCC _tup3 = TupleCC(Txn3, 1, 2.0, 3.0);
-	pos = Relation.Insert(_tup3);
-
-	TupleCC& tup3 = Relation[pos];
-
-	tup3.cc.Read(Txn4);
-	tup3.cc.Read(Txn5);
-
-	tup3.cc.UnlockRead();
-	success = tup3.cc.TryLock(Txn4);
-	assert(!success && "This lock should not succeed"); 
-
-	tup3.cc.UnlockRead();
-	success = tup3.cc.TryLock(Txn5);
-	assert(success && "This lock should succeed"); 
-
-	TupleCC tup4 = TupleCC(Txn5, tup3);
-
-	tup4.b = 3;
-
-	Relation.Insert(tup4);
-	success = tup3.cc.Retire(Txn5);
-	assert(success && "This retire should succeed");
-
-	success = tup3.cc.Retire(Txn4);
-	assert(!success && "This retire should not succeed");
-}
-
-template <>
-void test<MVOCC>() {
-	Transaction txn1;
-
-	TupleCC t1 = TupleCC(txn1, 1, 2.0, 3.0);
-	uint64 pos = Relation.Insert(t1);
-	
-	// transaction 2 tries to update it
-	Transaction txn2;
-	TupleCC& tup1 = Relation[pos]; // Get the original tuple
-	assert(tup1.cc.IsValid(txn2) && "This is a valid update");
-
-	TupleCC tup2 = TupleCC(txn2, tup1); // Create new Tuple
-	tup2.b = 3.0f; // Changes
-
-	bool success = tup1.cc.TryLock(txn2); // Lock the tuple for no more changes
-	assert(success && "This lock should succeed"); 
-
-	uint64 newPos = Relation.Insert(tup2); // Insert
-	tup1.cc.Retire(txn2); // Retire the tuple
-	tup1.cc.Unlock();
-												
-	// Testing for overlaps in writing
-	Transaction Txn3, Txn4, Txn5;
-	TupleCC _tup3 = TupleCC(Txn3, 1, 2.0, 3.0);
-	pos = Relation.Insert(_tup3);
-
-	TupleCC& tup3 = Relation[pos];
-	TupleCC tup4 = TupleCC(Txn4, tup3);
-	TupleCC tup5 = TupleCC(Txn5, tup3);
-
-	tup4.b = 3;
-	tup5.b = 3;
-
-	Txn4.Update();
-	Txn5.Update();
-
-	success = tup3.cc.TryLock(Txn4);
-	assert(success && "This lock should succeed"); 
-
-	success = tup3.cc.TryLock(Txn5);
-	assert(!success && "This lock should not succeed"); 
-
-	Relation.Insert(tup4);
-	tup3.cc.Retire(Txn4);
-	tup3.cc.Unlock();
-}
+#ifdef TESTING
+#include "test.cpp"
 
 int main() {
-	printf("Starting Test\n");
-	test<CC>();
-	printf("Test Succeed\n");
+	{
+		using CC = MVTO;
+
+		printf("Multiversion timestamp ordering");
+		printf("Starting Test\n");
+		test<CC>();
+		printf("Test Succeed\n");
+	}
+	{
+		using CC = MVOCC;
+
+		printf("Multiversion optimistic concurrency control");
+		printf("Starting Test\n");
+		test<CC>();
+		printf("Test Succeed\n");
+	}
+	{
+		using CC = MV2PL;
+
+		printf("Multiversion 2 phase locking");
+		printf("Starting Test\n");
+		test<CC>();
+		printf("Test Succeed\n");
+	}
 }
+
+#else
+
+int main() {
+	UNIMPLEMENTED;
+}
+
+#endif
